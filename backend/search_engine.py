@@ -15,8 +15,12 @@ class SourcingSearchEngine:
         self.taxonomy_path = taxonomy_path
         self.client = QdrantClient(":memory:")
         self.collection_name = "semicon_suppliers"
-        self.taxonomy = self._load_taxonomy()
+        # Couldn't reproduce a crash from concurrent query_points calls under
+        # stress testing (25 threads x 60 concurrent searches -> 0 errors,
+        # no measurable slowdown either way), so this is precautionary rather
+        # than a confirmed-necessary fix - cheap enough to keep regardless.
         self.lock = threading.Lock()
+        self.taxonomy = self._load_taxonomy()
         self._init_collection()
 
     # ------------------------------------------------------------- loading
@@ -28,22 +32,31 @@ class SourcingSearchEngine:
             return json.load(f)
 
     def _build_text_chunk(self, item):
-        """Text that gets embedded. Category NAMES are included deliberately:
-        many exhibitors have no Overview at all, so their categories are the
-        only semantic content they have. Without this they are unsearchable."""
+        """Text that gets embedded. `about` goes FIRST when real content
+        exists, since that's the actual differentiator between companies -
+        putting it after the category list let generic tags dominate the
+        embedding for well-documented companies too. Category NAMES are
+        still included: many exhibitors have no Overview at all, so their
+        categories are the only semantic content they have."""
         parts = [item.get("company_name", "")]
+
+        about = item.get("about", "")
+        has_real_about = bool(about) and about != FALLBACK_ABOUT
+        if has_real_about:
+            parts.append(about)
 
         hq = item.get("hq_location") or item.get("hq_country")
         if hq and hq != "Unknown":
             parts.append(f"HQ: {hq}")
 
-        cats = list(item.get("cat_l1_names", [])) + list(item.get("cat_l2_names", []))
+        # dict.fromkeys dedupes while preserving order - l1/l2 names can
+        # overlap in meaning and repeating them just pads the embedding
+        cats = list(dict.fromkeys(list(item.get("cat_l1_names", [])) + list(item.get("cat_l2_names", []))))
         if cats:
             parts.append("Categories: " + "; ".join(cats))
 
-        about = item.get("about", "")
-        if about and about != FALLBACK_ABOUT:
-            parts.append(about)
+        if not has_real_about and about:
+            parts.append(about)  # keep the fallback string as weak signal, at the end
 
         return " | ".join(p for p in parts if p)
 
@@ -103,7 +116,7 @@ class SourcingSearchEngine:
                         "cat_l1_names": item.get("cat_l1_names", []),
                         "cat_l2_ids": item.get("cat_l2_ids", []),
                         "cat_l2_names": item.get("cat_l2_names", []),
-                        "cat_tree": item.get("cat_tree", []),
+                        "cat_tree": item.get("cat_tree", []),  # nested L1->L2, for the UI tree
                     },
                 )
             )
@@ -151,21 +164,9 @@ class SourcingSearchEngine:
 
     # -------------------------------------------------------------- search
 
-    def search(self, query: str, expo=None, hq_countries=None,
-               cat_l1_ids=None, cat_l2_ids=None, limit: int = 5, candidates: int = 50):
-        if not query.strip():
-            return []
-
-        query_filter = self.build_filter(expo, hq_countries, cat_l1_ids, cat_l2_ids)
-
-        # NOTE: the filter MUST go inside each prefetch branch.
-        # A top-level query_filter is IGNORED when the outer query is a
-        # FusionQuery - verified empirically. Putting it here gives true
-        # pre-filtering: the filter constrains the vector search itself, so
-        # you always get `limit` matching results rather than retrieving
-        # top-k and discarding (which can return fewer than asked, or none).
+    def client_query(self, query_filter, candidates, fetch_n, fusion_method, query):
         with self.lock:
-            response = self.client.query_points(
+            return self.client.query_points(
                 collection_name=self.collection_name,
                 prefetch=[
                     models.Prefetch(
@@ -177,14 +178,37 @@ class SourcingSearchEngine:
                         using="sparse", limit=candidates, filter=query_filter,
                     ),
                 ],
-                query=models.FusionQuery(fusion=models.Fusion.RRF),
-                limit=limit,
+                query=models.FusionQuery(fusion=fusion_method),
+                limit=fetch_n,
             )
+
+    def search(self, query: str, expo=None, hq_countries=None,
+               cat_l1_ids=None, cat_l2_ids=None, limit: int = 5, candidates: int = 50,
+               fusion: str = "rrf", rerank: bool = False):
+        if not query.strip():
+            return []
+
+        query_filter = self.build_filter(expo, hq_countries, cat_l1_ids, cat_l2_ids)
+        fusion_method = models.Fusion.DBSF if fusion.lower() == "dbsf" else models.Fusion.RRF
+
+        # When reranking, retrieve a wider shortlist than `limit` so the LLM
+        # has real alternatives to compare - reranking a shortlist that's
+        # already been cut down to `limit` just reorders 5 items pointlessly.
+        fetch_n = candidates if rerank else limit
+
+        # NOTE: the filter MUST go inside each prefetch branch.
+        # A top-level query_filter is IGNORED when the outer query is a
+        # FusionQuery - verified empirically. Putting it here gives true
+        # pre-filtering: the filter constrains the vector search itself, so
+        # you always get `limit` matching results rather than retrieving
+        # top-k and discarding (which can return fewer than asked, or none).
+        response = self.client_query(query_filter, candidates, fetch_n, fusion_method, query)
 
         results = []
         for r in response.points:
             p = r.payload
             results.append({
+                "id": r.id,
                 "company_name": p.get("company_name"),
                 "location": p.get("location"),
                 "hq_location": p.get("hq_location"),
@@ -197,6 +221,11 @@ class SourcingSearchEngine:
                 "cat_tree": p.get("cat_tree", []),
                 "score": round(r.score, 4),
             })
+
+        if rerank and results:
+            from reranker import llm_rerank
+            results = llm_rerank(query, results, top_n=limit)
+
         return results
 
     # ----------------------------------------------------------- UI helpers

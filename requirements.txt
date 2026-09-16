@@ -6,3 +6,4 @@ beautifulsoup4
 lxml
 rank-bm25
 openai
+python-dotenv
