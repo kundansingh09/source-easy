@@ -1,5 +1,6 @@
 streamlit
 pandas
+qdrant-client[fastembed]>=1.15
 requests
 beautifulsoup4
 lxml
